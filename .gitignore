@@ -1,0 +1,7 @@
+build/
+out/
+frames/
+.vs/
+*.user
+third_party/
+thirdParty/
