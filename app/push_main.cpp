@@ -34,11 +34,13 @@ extern "C" {
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <shellapi.h>  // CommandLineToArgvW
 #endif
 
 using namespace streamer;
@@ -193,8 +195,38 @@ bool parseArgs(int argc, char** argv, PushOptions& opt, int& exitCode) {
 
 }  // namespace
 
+#ifdef _WIN32
+// Windows 的 main(argc, argv) 拿到的是系统 ANSI 代码页（中文系统是 GBK）的字节，
+// 而 FFmpeg（dshow 设备名）要的是 UTF-8。中文麦克风名直接传进去就会变成乱码、找不到设备。
+// 解决：用 GetCommandLineW 拿到 UTF-16 原始命令行，CommandLineToArgvW 拆成参数，
+// 再用 WideCharToMultiByte 逐个转成 UTF-8。
+static std::vector<std::string> utf8Args() {
+    std::vector<std::string> out;
+    int n = 0;
+    LPWSTR* wargv = CommandLineToArgvW(GetCommandLineW(), &n);
+    if (!wargv) return out;
+    for (int i = 0; i < n; ++i) {
+        int len = WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, nullptr, 0, nullptr, nullptr);
+        std::string s(len > 0 ? len - 1 : 0, '\0');
+        if (len > 1) WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, s.data(), len, nullptr, nullptr);
+        out.push_back(std::move(s));
+    }
+    LocalFree(wargv);
+    return out;
+}
+#endif
+
 int main(int argc, char** argv) {
 #ifdef _WIN32
+    // 用 UTF-8 版本的参数替换 argv（argsUtf8 要活到 main 结束，argv 里的指针指向它）
+    static std::vector<std::string> argsUtf8 = utf8Args();
+    static std::vector<char*> argvUtf8;
+    if (!argsUtf8.empty()) {
+        for (auto& a : argsUtf8) argvUtf8.push_back(a.data());
+        argvUtf8.push_back(nullptr);
+        argc = static_cast<int>(argsUtf8.size());
+        argv = argvUtf8.data();
+    }
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCtrlHandler(consoleCtrlHandler, TRUE);
 #else

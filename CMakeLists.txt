@@ -123,6 +123,10 @@ target_link_libraries(camera_capture PRIVATE streamer_capture)
 add_executable(camera_push app/push_main.cpp)
 find_package(Threads REQUIRED)
 target_link_libraries(camera_push PRIVATE streamer_capture Threads::Threads)
+if(WIN32)
+    # CommandLineToArgvW（把命令行参数转成 UTF-8，中文设备名才不会乱码）在 shell32 里
+    target_link_libraries(camera_push PRIVATE shell32)
+endif()
 
 # Windows 上把 FFmpeg 的 DLL 复制到 exe 旁边，双击/命令行运行时才能找到
 if(WIN32 AND FFMPEG_DLL_DIR AND EXISTS "${FFMPEG_DLL_DIR}")
