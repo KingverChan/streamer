@@ -14,8 +14,10 @@
 //   RtmpPublisher::writePacket FLV 封装 → RTMP 发给服务器
 // ============================================================================
 
+#include "capture/AudioCapture.h"
 #include "capture/CameraCapture.h"
 #include "capture/ScreenCapture.h"
+#include "core/AudioEncoder.h"
 #include "core/FrameQueue.h"
 #include "core/RtmpPublisher.h"
 #include "core/VideoEncoder.h"
@@ -23,6 +25,7 @@
 extern "C" {
 #include <libavutil/log.h>
 #include <libavutil/pixdesc.h>
+#include <libavutil/samplefmt.h>
 }
 
 #include <algorithm>
@@ -52,11 +55,13 @@ namespace {
 // ---------------------------------------------------------------------------
 std::atomic<bool> g_stop{false};
 ICapture* g_capture = nullptr;
+AudioCapture* g_audio = nullptr;
 RtmpPublisher* g_publisher = nullptr;
 
 void requestStop() {
     g_stop = true;
     if (g_capture) g_capture->requestStop();
+    if (g_audio) g_audio->requestStop();
     if (g_publisher) g_publisher->requestStop();
 }
 
@@ -83,6 +88,11 @@ struct PushOptions {
     std::string outSize;          // 输出分辨率，空 = 和采集一样
     long long maxFrames = 0;
     bool verbose = false;
+    // 音频（麦克风）。默认不采集：只有传了 --audio 才会打开麦克风
+    AudioOptions audio;
+    int audioIndex = -1;          // --audio-index N：按 --list-audio 的序号选麦克风（不用输中文名）
+    bool listAudio = false;
+    bool useAudio() const { return !audio.deviceName.empty() || audioIndex >= 0; }
 };
 
 void printUsage(const char* prog) {
@@ -109,6 +119,13 @@ void printUsage(const char* prog) {
         "      --no-mouse        画面里不画鼠标\n"
         "      --all-monitors    抓所有显示器（默认只抓主显示器）\n"
         "      （桌面默认等比缩放到不超过 1920x1080，可用 --out-size 覆盖）\n"
+        "\n"
+        "音频选项（默认不采集声音）:\n"
+        "      --list-audio      列出麦克风设备名\n"
+        "      --audio NAME      同时采集这个麦克风，编码成 AAC 一起推流\n"
+        "      --audio-index N   按 --list-audio 的序号选麦克风（名字有中文时更稳）\n"
+        "      --no-audio        不采集声音（默认）\n"
+        "      --audio-format F  音频输入类型，默认 Windows=dshow\n"
         "\n"
         "  -b, --bitrate KBPS    码率，单位 kbps，默认 2000\n"
         "  -g, --gop SECONDS     关键帧间隔（秒），默认 1。越小延迟越低\n"
@@ -171,6 +188,11 @@ bool parseArgs(int argc, char** argv, PushOptions& opt, int& exitCode) {
             else if (a == "-n" || a == "--frames") opt.maxFrames = toInt(next());
             else if (a == "-f" || a == "--format") opt.camera.inputFormat = opt.screenOpt.inputFormat = next();
             else if (a == "-v" || a == "--verbose") opt.verbose = true;
+            else if (a == "--list-audio") opt.listAudio = true;
+            else if (a == "--audio") opt.audio.deviceName = next();
+            else if (a == "--audio-index") opt.audioIndex = static_cast<int>(toInt(next()));
+            else if (a == "--no-audio") { opt.audio.deviceName.clear(); opt.audioIndex = -1; }
+            else if (a == "--audio-format") opt.audio.inputFormat = next();
             else throw std::invalid_argument("未知参数: " + a);
         } catch (const std::invalid_argument& e) {
             std::cerr << e.what() << "\n\n";
@@ -179,6 +201,7 @@ bool parseArgs(int argc, char** argv, PushOptions& opt, int& exitCode) {
             return false;
         }
     }
+    if (opt.listAudio) return true;
     if (opt.screen) {
         // 桌面模式下 -d 可以用来直接指定 gdigrab 的 URL（例如 -d "title=计算器"），一般不需要
         if (!opt.camera.deviceName.empty() && opt.screenOpt.target.empty()) opt.screenOpt.target = opt.camera.deviceName;
@@ -239,6 +262,32 @@ int main(int argc, char** argv) {
     if (!parseArgs(argc, argv, opt, exitCode)) return exitCode;
     av_log_set_level(opt.verbose ? AV_LOG_DEBUG : AV_LOG_INFO);
 
+    // --list-audio: 只列出麦克风就退出
+    if (opt.listAudio) {
+        std::vector<std::string> names;
+        std::string err;
+        const std::string fmt = opt.audio.inputFormat.empty() ? AudioCapture::defaultInputFormat() : opt.audio.inputFormat;
+        if (!AudioCapture::listDevices(fmt, names, err)) {
+            // 有的 FFmpeg 版本不支持枚举，就让 dshow 自己把设备列表打印到日志（"..." (audio) 那几行就是麦克风）
+            std::cerr << "列出音频设备失败: " << err << "，改为打印 FFmpeg 的设备日志:\n";
+            CameraCapture::printDevicesToLog(fmt);
+            return 0;
+        }
+        std::cout << "音频设备（" << names.size() << " 个），用 --audio-index 序号 或 --audio \"名字\" 选择:\n";
+        for (size_t i = 0; i < names.size(); ++i) std::cout << "  [" << i << "] " << names[i] << "\n";
+        return 0;
+    }
+
+    // 音视频共用的时钟起点。开了音频时，视频和音频的时间戳都用“离 t0 过了多少毫秒”，
+    // 这样两路的时间戳在同一个坐标系里，播放器才能对齐（音画同步）
+    using SteadyClock = std::chrono::steady_clock;
+    const auto t0 = SteadyClock::now();
+    auto msSinceT0 = [&] {
+        return static_cast<int64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(SteadyClock::now() - t0).count());
+    };
+    const bool withAudio = opt.useAudio();
+
     // avformat_network_init: 初始化网络模块（Windows 上会初始化 Winsock），推 RTMP 前调用一次
     avformat_network_init();
 
@@ -269,6 +318,7 @@ int main(int argc, char** argv) {
         std::cerr << "读取第一帧失败: " << capture->lastError() << "\n";
         return 1;
     }
+    if (withAudio) frame->pts = msSinceT0();  // 有音频时，用到达时间当时间戳（见 t0 的注释）
     VideoStreamInfo info = capture->streamInfo();
     std::cout << "采集: " << info.width << "x" << info.height << " "
               << (av_get_pix_fmt_name(info.pixelFormat) ? av_get_pix_fmt_name(info.pixelFormat) : "?")
@@ -293,16 +343,93 @@ int main(int argc, char** argv) {
                 captureFailed = true;
                 break;
             }
+            if (withAudio) f->pts = msSinceT0();  // 在采集线程打时间戳，最接近真实的采集时刻
             queue.push(f.get());  // 帧的数据被"搬"进队列，f 变空，下一轮可以复用
         }
         queue.close();  // 告诉编码线程：不会再有新帧了
     });
 
+    // ---------------- 2.5 音频：打开麦克风 + AAC 编码器 + 音频线程（只有传了 --audio 才执行） ----------------
+    // 音频线程：读麦克风 → 编码 AAC → 直接交给 publisher（publisher 内部有锁）。
+    // 连上服务器之前读到的声音直接丢掉，否则一连上就会把积压的几秒旧声音一下子推出去
+    if (withAudio && opt.audioIndex >= 0) {
+        std::vector<std::string> names;
+        std::string err;
+        const std::string fmt = opt.audio.inputFormat.empty() ? AudioCapture::defaultInputFormat() : opt.audio.inputFormat;
+        if (!AudioCapture::listDevices(fmt, names, err) || opt.audioIndex >= static_cast<int>(names.size())) {
+            std::cerr << "错误: 没有序号为 " << opt.audioIndex << " 的麦克风（共 " << names.size()
+                      << " 个，先运行 --list-audio 查看）" << (err.empty() ? "" : "：" + err) << "\n";
+            capture->requestStop();
+            captureThread.join();
+            return 1;
+        }
+        opt.audio.deviceName = names[opt.audioIndex];
+    }
+    AudioCapture audioCap(opt.audio);
+    AudioEncoder audioEnc;
+    RtmpPublisher publisher;
+    std::atomic<bool> publishing{false};
+    std::atomic<bool> audioFailed{false};
+    std::atomic<long long> audioPackets{0};
+    std::string audioError;
+    std::thread audioThread;
+    if (withAudio) {
+        std::cout << "正在打开麦克风: " << opt.audio.deviceName << " ...\n";
+        g_audio = &audioCap;
+        if (!audioCap.open()) {
+            std::cerr << "错误: " << audioCap.lastError() << "\n"
+                      << "提示: 先运行 camera_push --list-audio 查看麦克风的准确名字\n";
+            capture->requestStop();
+            captureThread.join();
+            return 1;
+        }
+        if (!audioEnc.open(audioCap.decoderContext())) {
+            std::cerr << "错误: " << audioEnc.lastError() << "\n";
+            capture->requestStop();
+            captureThread.join();
+            return 1;
+        }
+        const AVCodecContext* dec = audioCap.decoderContext();
+        std::cout << "音频: " << dec->sample_rate << " Hz " << dec->ch_layout.nb_channels << " 声道 "
+                  << (av_get_sample_fmt_name(dec->sample_fmt) ? av_get_sample_fmt_name(dec->sample_fmt) : "?")
+                  << " → AAC " << audioEnc.context()->sample_rate << " Hz "
+                  << audioEnc.context()->ch_layout.nb_channels << " 声道 128 kbps\n";
+
+        audioThread = std::thread([&] {
+            FramePtr af = makeFrame();
+            auto sendAudio = [&](AVPacket* pkt) {
+                ++audioPackets;
+                return publisher.writePacket(pkt, audioEnc.timeBase(), true);
+            };
+            while (!g_stop && af) {
+                ReadResult rr = audioCap.readFrame(af.get());
+                if (rr == ReadResult::Again) continue;
+                if (rr == ReadResult::Eof) break;
+                if (rr == ReadResult::Error) {
+                    audioError = audioCap.lastError();
+                    audioFailed = true;
+                    break;
+                }
+                if (!publishing) continue;  // 还没连上服务器：丢掉
+                // 这一包声音的“开始时刻” = 现在 - 这包的时长（麦克风是攒满一包才交出来的）
+                const int64_t durMs = af->sample_rate > 0 ? af->nb_samples * 1000LL / af->sample_rate : 0;
+                if (!audioEnc.encode(af.get(), msSinceT0() - durMs, sendAudio)) {
+                    audioError = audioEnc.lastError().empty() ? publisher.lastError() : audioEnc.lastError();
+                    audioFailed = true;
+                    break;
+                }
+            }
+        });
+    }
+
     // 出错提前退出时，先停掉采集线程再返回（std::thread 没 join 就析构会直接崩溃）
     auto stopCapture = [&] {
         capture->requestStop();
         if (captureThread.joinable()) captureThread.join();
+        audioCap.requestStop();
+        if (audioThread.joinable()) audioThread.join();
         g_capture = nullptr;
+        g_audio = nullptr;
         g_publisher = nullptr;
     };
 
@@ -340,10 +467,9 @@ int main(int argc, char** argv) {
               << " " << opt.bitrateKbps << " kbps\n";
 
     // ---------------- 4. 连接服务器（最多等 5 秒，见 RtmpPublisher 的 rw_timeout） ----------------
-    RtmpPublisher publisher;
     g_publisher = &publisher;
     std::cout << "正在连接: " << opt.url << " ...\n";
-    if (!publisher.open(opt.url, encoder.context())) {
+    if (!publisher.open(opt.url, encoder.context(), withAudio ? audioEnc.context() : nullptr)) {
         std::cerr << "错误: " << publisher.lastError() << "\n"
                   << "提示: 确认服务器已启动（docker compose up -d），地址形如 rtmp://IP/live/流名\n"
                   << "      在家里请用局域网地址（例如 rtmp://192.168.1.129:1935/live/test）；\n"
@@ -351,13 +477,14 @@ int main(int argc, char** argv) {
         stopCapture();
         return 1;
     }
-    std::cout << "推流中，按 Ctrl+C 停止\n\n";
+    publishing = true;  // 音频线程从现在开始编码并发送
+    std::cout << "推流中" << (withAudio ? "（视频+音频）" : "") << "，按 Ctrl+C 停止\n\n";
 
     // 编码器每吐出一个包，就交给 publisher 发出去
     auto sendPacket = [&](AVPacket* pkt) { return publisher.writePacket(pkt, encoder.timeBase()); };
 
     // ---------------- 5. 编码推流（当前线程） ----------------
-    using Clock = std::chrono::steady_clock;
+    using Clock = std::chrono::steady_clock; //测间隔
     const auto startTime = Clock::now();
     auto lastReport = startTime;
     int64_t firstPts = AV_NOPTS_VALUE;
@@ -377,7 +504,9 @@ int main(int argc, char** argv) {
         // 计算这一帧的时间戳（毫秒，从 0 开始）：
         // 优先用设备给的 pts（更准），没有就用系统时钟
         int64_t ptsMs;
-        if (f->pts != AV_NOPTS_VALUE) {
+        if (withAudio) {
+            ptsMs = f->pts;  // 采集线程已经打好了“离 t0 的毫秒数”，和音频同一个时钟
+        } else if (f->pts != AV_NOPTS_VALUE) {
             if (firstPts == AV_NOPTS_VALUE) firstPts = f->pts;
             // av_rescale_q: 把 pts 从采集的时间单位换算成毫秒，内部处理了溢出和取整
             ptsMs = av_rescale_q(f->pts - firstPts, info.timeBase, AVRational{1, 1000});
@@ -388,6 +517,11 @@ int main(int argc, char** argv) {
         if (ptsMs <= lastPtsMs) ptsMs = lastPtsMs + 1;
         lastPtsMs = ptsMs;
 
+        if (audioFailed) {
+            std::cerr << "\n音频出错: " << audioError << "\n";
+            result = 1;
+            break;
+        }
         if (!encoder.encode(f.get(), ptsMs, sendPacket)) {
             std::cerr << "\n错误: " << (publisher.lastError().empty() ? encoder.lastError() : publisher.lastError()) << "\n";
             result = 1;
@@ -402,9 +536,11 @@ int main(int argc, char** argv) {
         if (sec >= 1.0) {
             int64_t bytes = publisher.bytesWritten();
             long long dropped = queue.droppedCount();
-            std::printf("已推 %lld 帧  时长 %.1fs  帧率 %.1f  码率 %.0f kbps  丢帧 %lld\n",
+            std::printf("已推 %lld 帧  时长 %.1fs  帧率 %.1f  码率 %.0f kbps  丢帧 %lld",
                         frameCount, ptsMs / 1000.0, framesSinceReport / sec,
                         (bytes - bytesAtLastReport) * 8 / 1000.0 / sec, dropped - droppedAtLastReport);
+            if (withAudio) std::printf("  音频包 %lld", audioPackets.load());
+            std::printf("\n");
             std::fflush(stdout);
             lastReport = now;
             framesSinceReport = 0;
@@ -418,14 +554,21 @@ int main(int argc, char** argv) {
     if (g_stop) std::cout << "\n收到 Ctrl+C，正在停止...\n";
     capture->requestStop();  // 让采集线程的 readFrame 尽快返回
     captureThread.join();    // 等采集线程退出后，才能安全地关闭摄像头
+    audioCap.requestStop();
+    if (audioThread.joinable()) audioThread.join();
     if (captureFailed) {
         std::cerr << "采集失败: " << capture->lastError() << "\n";
         result = 1;
     }
     if (result == 0) encoder.flush(sendPacket);  // 把编码器里剩下的帧发完
+    if (result == 0 && withAudio && !audioFailed) {
+        audioEnc.flush([&](AVPacket* pkt) { return publisher.writePacket(pkt, audioEnc.timeBase(), true); });
+    }
     publisher.close();
     encoder.close();
     capture->close();
+    audioCap.close();
+    g_audio = nullptr;
     g_publisher = nullptr;
     g_capture = nullptr;
     avformat_network_deinit();

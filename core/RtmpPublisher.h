@@ -15,6 +15,7 @@
 #include "core/FFmpegUtils.h"
 
 #include <atomic>
+#include <mutex>
 #include <string>
 
 namespace streamer {
@@ -27,17 +28,23 @@ public:
     RtmpPublisher& operator=(const RtmpPublisher&) = delete;
 
     // encoder: 已经打开的编码器上下文，用来告诉服务器视频参数（宽高、SPS/PPS 等）
-    bool open(const std::string& url, const AVCodecContext* encoder);
+    // audioEncoder: 可选，AAC 编码器上下文；传了就多加一路音频流
+    bool open(const std::string& url, const AVCodecContext* encoder,
+              const AVCodecContext* audioEncoder = nullptr);
 
     // 写一个压缩包。srcTimeBase 是包里 pts/dts 的时间单位（编码器的 time_base）
-    bool writePacket(AVPacket* packet, AVRational srcTimeBase);
+    // isAudio=true 写到音频流。线程安全：视频线程和音频线程可以同时调用
+    bool writePacket(AVPacket* packet, AVRational srcTimeBase, bool isAudio = false);
 
     // 写结尾并断开连接。可以重复调用
     void close();
 
     bool isOpen() const { return formatCtx_ != nullptr; }
     int64_t bytesWritten() const { return bytesWritten_; }
-    const std::string& lastError() const { return lastError_; }
+    std::string lastError() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return lastError_;
+    }
 
     // 让卡在网络读写上的调用尽快返回（Ctrl+C 用）
     void requestStop() { stopRequested_ = true; }
@@ -52,8 +59,11 @@ private:
 
     std::unique_ptr<AVFormatContext, OutputDeleter> formatCtx_;
     AVStream* stream_ = nullptr;   // 归 formatCtx_ 所有，不需要单独释放
+    AVStream* audioStream_ = nullptr;
     bool headerWritten_ = false;
-    int64_t bytesWritten_ = 0;
+    std::atomic<int64_t> bytesWritten_{0};
+    // av_interleaved_write_frame 不是线程安全的，音视频两个线程写同一个 formatCtx_ 要加锁
+    mutable std::mutex mutex_;
     std::string url_;
     std::string lastError_;
     std::atomic<bool> stopRequested_{false};

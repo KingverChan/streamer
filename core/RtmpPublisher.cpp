@@ -19,7 +19,8 @@ int RtmpPublisher::interruptCallback(void* opaque) {
     return static_cast<RtmpPublisher*>(opaque)->stopRequested_ ? 1 : 0;
 }
 
-bool RtmpPublisher::open(const std::string& url, const AVCodecContext* encoder) {
+bool RtmpPublisher::open(const std::string& url, const AVCodecContext* encoder,
+                         const AVCodecContext* audioEncoder) {
     close();
     stopRequested_ = false;
     url_ = url;
@@ -50,6 +51,21 @@ bool RtmpPublisher::open(const std::string& url, const AVCodecContext* encoder) 
     }
     stream_->time_base = encoder->time_base;  // 只是建议值，write_header 时 FLV 会改成 1/1000
 
+    // 2.5) 有音频就再加一路 AAC 流。FLV 里一个视频 + 一个音频是最常见的组合
+    if (audioEncoder) {
+        audioStream_ = avformat_new_stream(formatCtx_.get(), nullptr);
+        if (!audioStream_ ||
+            (ret = avcodec_parameters_from_context(audioStream_->codecpar, audioEncoder)) < 0) {
+            lastError_ = "添加音频流失败: " + avErrorToString(ret);
+            close();
+            return false;
+        }
+        audioStream_->time_base = audioEncoder->time_base;
+        // max_interleave_delta: 音视频交错写入时，最多为了“等另一路”缓存多久（微秒）。
+        // 默认 10 秒，万一麦克风卡住，视频会被憋住 10 秒；直播改成 0.5 秒
+        formatCtx_->max_interleave_delta = 500000;
+    }
+
     // 3) 打开网络连接（或本地文件）。rtmp:// 地址会在这里完成 TCP 连接和 RTMP 握手
     if (!(formatCtx_->oformat->flags & AVFMT_NOFILE)) {
         // rw_timeout: 网络读写超过 5 秒没反应就报错，避免服务器失联时程序一直卡住（单位微秒）
@@ -79,14 +95,20 @@ bool RtmpPublisher::open(const std::string& url, const AVCodecContext* encoder) 
     return true;
 }
 
-bool RtmpPublisher::writePacket(AVPacket* packet, AVRational srcTimeBase) {
+bool RtmpPublisher::writePacket(AVPacket* packet, AVRational srcTimeBase, bool isAudio) {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (!headerWritten_) {
         lastError_ = "推流未打开";
         return false;
     }
-    packet->stream_index = stream_->index;
+    AVStream* st = isAudio ? audioStream_ : stream_;
+    if (!st) {
+        lastError_ = "没有音频流，却写了音频包";
+        return false;
+    }
+    packet->stream_index = st->index;
     // av_packet_rescale_ts: 把 pts/dts/duration 从编码器的时间单位换算成输出流的时间单位
-    av_packet_rescale_ts(packet, srcTimeBase, stream_->time_base);
+    av_packet_rescale_ts(packet, srcTimeBase, st->time_base);
     const int size = packet->size;
 
     // av_interleaved_write_frame: 写一个包。多路流（音频+视频）时它会按时间戳排好顺序再发。
@@ -101,6 +123,7 @@ bool RtmpPublisher::writePacket(AVPacket* packet, AVRational srcTimeBase) {
 }
 
 void RtmpPublisher::close() {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (formatCtx_ && headerWritten_) {
         // 走到这里说明主循环已经退出，不再需要“中断”。先清掉标志，
         // 否则 av_write_trailer 会被中断回调打断，结尾写不完整（本地 flv 文件会没有时长信息）
@@ -110,6 +133,7 @@ void RtmpPublisher::close() {
     }
     headerWritten_ = false;
     stream_ = nullptr;
+    audioStream_ = nullptr;
     formatCtx_.reset();
 }
 

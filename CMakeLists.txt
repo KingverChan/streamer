@@ -38,7 +38,7 @@ if(NOT FFMPEG_ROOT AND WIN32)
         endif()
     endforeach()
 endif()
-set(FFMPEG_COMPONENTS avdevice avformat avcodec swscale avutil)
+set(FFMPEG_COMPONENTS avdevice avformat avcodec swscale swresample avutil)
 
 add_library(FFmpeg::FFmpeg INTERFACE IMPORTED)
 
@@ -66,7 +66,7 @@ else()
         find_package(PkgConfig QUIET)
         if(PkgConfig_FOUND)
             pkg_check_modules(FFMPEG_PC IMPORTED_TARGET
-                libavdevice libavformat libavcodec libswscale libavutil)
+                libavdevice libavformat libavcodec libswscale libswresample libavutil)
         endif()
         if(FFMPEG_PC_FOUND)
             message(STATUS "使用 pkg-config 的 FFmpeg ${FFMPEG_PC_libavformat_VERSION}")
@@ -92,13 +92,15 @@ add_library(streamer_core STATIC
     core/VideoEncoder.cpp
     core/RtmpPublisher.h
     core/RtmpPublisher.cpp
+    core/AudioEncoder.h
+    core/AudioEncoder.cpp
     core/FrameQueue.h
 )
 target_include_directories(streamer_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(streamer_core PUBLIC FFmpeg::FFmpeg)
 
 # ============================================================================
-# capture: 采集源（摄像头 CameraCapture + 桌面 ScreenCapture）
+# capture: 采集源（摄像头 CameraCapture + 桌面 ScreenCapture + 麦克风 AudioCapture）
 # ============================================================================
 add_library(streamer_capture STATIC
     capture/ICapture.h
@@ -106,6 +108,8 @@ add_library(streamer_capture STATIC
     capture/CameraCapture.cpp
     capture/ScreenCapture.h
     capture/ScreenCapture.cpp
+    capture/AudioCapture.h
+    capture/AudioCapture.cpp
 )
 target_link_libraries(streamer_capture PUBLIC streamer_core)
 if(WIN32)
