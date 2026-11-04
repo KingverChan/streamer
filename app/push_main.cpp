@@ -472,7 +472,7 @@ int main(int argc, char** argv) {
     if (!publisher.open(opt.url, encoder.context(), withAudio ? audioEnc.context() : nullptr)) {
         std::cerr << "错误: " << publisher.lastError() << "\n"
                   << "提示: 确认服务器已启动（docker compose up -d），地址形如 rtmp://IP/live/流名\n"
-                  << "      在家里请用局域网地址（例如 rtmp://192.168.1.129:1935/live/test）；\n"
+                  << "      在家里请用局域网地址（例如 rtmp://192.168.x.x:1935/live/test）；\n"
                   << "      用域名/公网地址的话，路由器要把外网 1935 端口转发到服务器\n";
         stopCapture();
         return 1;

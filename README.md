@@ -1,7 +1,19 @@
-# streamer —— 摄像头采集（第 1 步）
+# streamer —— 摄像头 / 桌面采集 + RTMP 推流
 
-用 C++17 + FFmpeg API（已在 7.1 和 9.0.2 上编译测试）（libavdevice 的 dshow）采集摄像头，打印每一帧的信息，并可把前 N 帧保存成 BMP/PPM 图片。
-这是「摄像头 + 桌面采集 → 编码 → RTMP 推流」项目的第一步，现在只做采集。
+用 C++17 + FFmpeg API 写的推流客户端：采集摄像头或桌面，可选同时采集麦克风，编码后通过 RTMP 推到服务器，也能存成本地 `.flv`。
+在 Windows + FFmpeg 9.0.2 上编译并实机运行过（最早的摄像头部分也在 7.1 上编译过）。
+
+- `camera_push`：采集 → 编码 → 推流。见第 4 节
+- `camera_capture`：只采集，打印每一帧的信息，可把前 N 帧保存成 BMP/PPM 图片。见第 3 节
+
+## 功能
+
+- 摄像头采集（dshow）
+- 桌面采集（gdigrab）：默认只抓主显示器，超过 1920x1080 时等比缩小；也可以只抓一个窗口或一块区域
+- 麦克风采集（dshow）：重采样后编码成 AAC，和视频走同一路 RTMP/FLV，音视频用同一个时钟起点打时间戳。默认不打开麦克风
+- H.264 编码（默认 libx264，没有就依次试硬件编码器）
+
+只采集麦克风，不采集系统声音。
 
 ## 目录结构
 
@@ -12,19 +24,17 @@ streamer/
 │   ├── FFmpegUtils.h        unique_ptr + 自定义 deleter 管理 FFmpeg 资源；av_strerror 错误转字符串
 │   ├── FrameSaver.h/.cpp    sws_scale 转 RGB，写 BMP / PPM
 │   ├── VideoEncoder.h/.cpp  转 yuv420p，编码成 H.264（libx264 / 硬件编码器）
-│   ├── RtmpPublisher.h/.cpp FLV 封装 + RTMP 推流（也能写本地 .flv 文件）
+│   ├── AudioEncoder.h/.cpp  PCM 重采样 → FIFO 攒帧 → AAC 编码
+│   ├── RtmpPublisher.h/.cpp FLV 封装 + RTMP 推流，视频和音频两路（也能写本地 .flv 文件）
 ├── capture/                 采集源
 │   ├── ICapture.h           统一接口：open / close / readFrame
 │   ├── CameraCapture.h/.cpp 摄像头实现（dshow），列设备、打开、读包、解码
+│   ├── ScreenCapture.h/.cpp 桌面实现（gdigrab），同样实现 ICapture
+│   ├── AudioCapture.h/.cpp  麦克风（dshow），列设备、打开、读 PCM
 └── app/
     ├── main.cpp             camera_capture：采集、打印帧信息、存图
     └── push_main.cpp        camera_push：采集 → 编码 → 推流
 ```
-
-后面要加的模块：
-- `capture/ScreenCapture`：桌面采集（gdigrab 或 DXGI），同样实现 `ICapture`
-- `core/Encoder`：把 `AVFrame` 编码成 H.264
-- `core/RtmpPublisher`：封装成 FLV，推到 RTMP 服务器
 
 ## 1. 安装 FFmpeg 开发库（二选一）
 
@@ -45,14 +55,14 @@ streamer/
 ```powershell
 vcpkg install ffmpeg:x64-windows
 ```
-默认特性已包含 avcodec / avdevice / avformat / swscale。
+默认特性已包含 avcodec / avdevice / avformat / swscale / swresample。
 
 ## 2. 编译（Windows + Visual Studio 2022）
 
 在 “x64 Native Tools Command Prompt for VS 2022” 或 PowerShell 里：
 
 ```powershell
-cd C:\Users\Jimmy\Documents\GitHub\streamer
+cd streamer
 
 # 方式 A：指定 FFMPEG_ROOT
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DFFMPEG_ROOT=C:/ffmpeg
@@ -103,31 +113,80 @@ cd build\Release
 
 ## 4. 推流到服务器（camera_push）
 
-数据流：`CameraCapture` 采集原始帧 → `VideoEncoder` 转 yuv420p 并编码成 H.264 → `RtmpPublisher` 封装成 FLV，通过 RTMP 发给服务器。
+数据流：`CameraCapture` 或 `ScreenCapture` 采集原始帧 → `VideoEncoder` 转 yuv420p 并编码成 H.264 → `RtmpPublisher` 封装成 FLV，通过 RTMP 发给服务器。开了麦克风时，`AudioCapture` → `AudioEncoder`（AAC）在单独的线程里跑，写进同一路 FLV。
 
-接收端用你自己的 [live-streaming-server](../live-streaming-server)（Docker 里的 SRS）：RTMP 端口 1935，播放端口 8080。
+接收端用你自己的 [live-streaming-server](../live-streaming-server)（Docker 里的 SRS）：RTMP 端口 1935，播放端口 8080。下面的 `your-server` 换成你的服务器地址。
 
 ```powershell
 # 推到你的服务器（流名 test）
-.\camera_push.exe -d "Integrated Camera" -s 1280x720 -o rtmp://jimmy-chan.duckdns.org/live/test
+.\camera_push.exe -d "Integrated Camera" -s 1280x720 -o rtmp://your-server/live/test
 
 # 没有服务器时，先录成本地文件验证编码是否正常（用 VLC 或 ffplay 打开 test.flv）
 .\camera_push.exe -d "Integrated Camera" -s 1280x720 -o test.flv -n 300
 ```
 
 播放验证（任选一个）：
-- 浏览器打开 `http://jimmy-chan.duckdns.org:8080/app/live.html?s=test`
-- VLC → 媒体 → 打开网络串流 → `http://jimmy-chan.duckdns.org:8080/live/test.flv`
-- 命令行 `ffplay http://jimmy-chan.duckdns.org:8080/live/test.flv`
+- 浏览器打开 `http://your-server:8080/live.html?s=test`（用 live-streaming-server 的 compose 部署时，路径是 `/app/live.html`）
+- VLC → 媒体 → 打开网络串流 → `http://your-server:8080/live/test.flv`
+- 命令行 `ffplay http://your-server:8080/live/test.flv`
 
 常用参数：`-b 3000` 码率 3000 kbps；`--out-size 854x480` 推流时缩小分辨率；`--encoder h264_mf` 指定编码器（默认先用 libx264，没有就依次试 NVIDIA / Intel / AMD 硬件编码器和 Windows 自带的 h264_mf）。
+
+### 桌面推流（--screen）
+
+```powershell
+# 推主显示器（流名 desktop）
+.\camera_push.exe --screen -r 30 -o rtmp://your-server/live/desktop
+
+# 先录成本地文件验证（300 帧后退出）
+.\camera_push.exe --screen -r 30 -o desktop.flv -n 300
+
+# 只抓一个窗口，或者一块区域
+.\camera_push.exe --screen --window "窗口标题" -o rtmp://your-server/live/desktop
+.\camera_push.exe --screen --region 1280x720 --offset 100,200 -o rtmp://your-server/live/desktop
+```
+
+| 参数 | 作用 |
+|---|---|
+| `--screen` | 采集桌面（Windows 用 gdigrab），不需要 `-d` |
+| `--window TITLE` | 只抓标题为 TITLE 的窗口 |
+| `--region WxH` | 只抓一块区域 |
+| `--offset X,Y` | 区域左上角坐标 |
+| `--no-mouse` | 画面里不画鼠标 |
+| `--all-monitors` | 抓所有显示器（默认只抓主显示器） |
+| `--out-size WxH` | 推流分辨率。不指定时，桌面超过 1920x1080 会等比缩小 |
+
+### 加上麦克风（--audio / --audio-index）
+
+默认不碰麦克风，只有传了 `--audio` 或 `--audio-index` 才会打开。
+
+```powershell
+# 列出麦克风，看序号和名字
+.\camera_push.exe --list-audio
+
+# 桌面 + 麦克风。名字带中文时用序号最稳
+.\camera_push.exe --screen -r 30 --audio-index 0 -o rtmp://your-server/live/desktop
+.\camera_push.exe --screen -r 30 --audio "麦克风名字" -o rtmp://your-server/live/desktop
+```
+
+用 live.html 播放带声音的流，要在地址后面加 `&audio=1`（页面默认按无音频打开），再点喇叭取消静音。
+
+### 延迟和测试情况
+
+- **端到端延迟约 0.6~0.9 秒**（局域网，从桌面采集到浏览器播放）。测法是让屏幕上的秒表经过采集、推流、回放到浏览器，再对照两个读数，手工读数，只能算粗略值。一共测了两轮：第一轮 6 次约 0.9 秒，第二轮 5 次约 0.6 秒，两轮差距的原因还没查清。这些都是加麦克风之前测的纯视频流。
+- 在 Windows 实机上跑通过：摄像头推流、`--screen`（主显示器）、`--audio-index`（浏览器能听到声音）。其余桌面开关（`--window`、`--region`、`--offset`、`--no-mouse`、`--all-monitors`）还没有逐项实测。
+- 已知限制：gdigrab 靠 GDI 逐帧截屏，分辨率高时帧率可能到不了设定值（抓 3 个屏拼成的 3000x2104 时只有 12~22 fps），所以默认只抓主显示器。只抓主显示器之后的帧率还没有重新确认。
+
+### 推流常见问题
 
 | 现象 | 原因 / 解决 |
 |---|---|
 | `连接失败 ... Connection refused` | 服务器没启动（`docker compose up -d`），或路由器没转发 1935 端口 |
 | `连接失败 ... timed out` | 域名解析不对或防火墙拦了 1935，先在服务器本机用 `./scripts/push_test.sh` 测 |
-| 能连上但播放器黑屏 | 播放器要等第一个关键帧（默认每 2 秒一个），等几秒；或检查播放地址的流名是否一致 |
-| 延迟比较大（3~5 秒） | 正常：HTTP-FLV 有缓冲，HLS 延迟更大（10 秒以上） |
+| 能连上但播放器黑屏 | 播放器要等第一个关键帧（默认每 1 秒一个），等几秒；或检查播放地址的流名是否一致 |
+| 网页一直转圈，但 ffplay 能播 | 纯视频流不要带 `audio=1`：播放器会一直等音频轨道 |
+| 延迟比较大（3~5 秒） | 多半是播放器的缓冲：VLC 和默认参数的 ffplay 缓冲较大，可以换 live.html 或 `ffplay -fflags nobuffer`；HLS 延迟更大（10 秒以上） |
+| 麦克风名字带中文时报找不到设备 | 用 `--audio-index` 按序号选 |
 
 ## 5. 常见问题
 
@@ -149,9 +208,11 @@ cd build\Release
 3. `CameraCapture::readFrame()`：`av_read_frame` 读包 → `avcodec_send_packet` → `avcodec_receive_frame` 取帧
 4. `core/FrameSaver.cpp`：`sws_getContext` + `sws_scale` 把 YUV 转成 RGB/BGR，再写 BMP / PPM 文件头和像素
 5. `core/FFmpegUtils.h`：所有 FFmpeg 对象的 RAII 包装
-6. `app/push_main.cpp` → `main()`：打开摄像头 → 打开编码器 → 连接服务器 → 循环“读帧 → 算 pts → encode → writePacket”
+6. `app/push_main.cpp` → `main()`：打开采集源（摄像头或桌面）→ 打开编码器 → 连接服务器 → 循环“读帧 → 算 pts → encode → writePacket”
 7. `core/VideoEncoder.cpp`：`avcodec_find_encoder_by_name` → `avcodec_open2`（preset/tune 低延迟）→ `sws_scale` → `avcodec_send_frame` / `avcodec_receive_packet`
 8. `core/RtmpPublisher.cpp`：`avformat_alloc_output_context2("flv")` → `avformat_new_stream` → `avio_open2` → `avformat_write_header` → `av_interleaved_write_frame` → `av_write_trailer`
+9. `capture/ScreenCapture.cpp`：结构和 `CameraCapture` 一一对应，输入格式换成 gdigrab，先 `SetProcessDPIAware`，再按主显示器大小设 `video_size`
+10. `capture/AudioCapture.cpp` + `core/AudioEncoder.cpp`：dshow 读 PCM → `swr_convert` 重采样成 fltp → `AVAudioFifo` 攒够 1024 个采样点 → AAC 编码。音频单独一个线程，音视频用同一个 `steady_clock` 起点打时间戳，`RtmpPublisher` 内部加锁，两路写同一个 FLV
 
 ## 7. `CameraCapture::open()` 详解
 
