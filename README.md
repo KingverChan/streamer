@@ -143,7 +143,7 @@ cd build\Release
 ## 6. 代码主线（建议按这个顺序读）
 
 1. `app/main.cpp` → `main()`：解析参数 → 创建 `CameraCapture` → `open()` → 循环 `readFrame()`
-2. `capture/CameraCapture.cpp` → `open()`：
+2. `capture/CameraCapture.cpp` → `open()`（详细拆解见第 7 节）：
    `avdevice_register_all` → `av_find_input_format("dshow")` → `avformat_open_input("video=名字")`
    → `avformat_find_stream_info` → `av_find_best_stream` → `avcodec_alloc_context3` / `avcodec_parameters_to_context` / `avcodec_open2`
 3. `CameraCapture::readFrame()`：`av_read_frame` 读包 → `avcodec_send_packet` → `avcodec_receive_frame` 取帧
@@ -152,3 +152,77 @@ cd build\Release
 6. `app/push_main.cpp` → `main()`：打开摄像头 → 打开编码器 → 连接服务器 → 循环“读帧 → 算 pts → encode → writePacket”
 7. `core/VideoEncoder.cpp`：`avcodec_find_encoder_by_name` → `avcodec_open2`（preset/tune 低延迟）→ `sws_scale` → `avcodec_send_frame` / `avcodec_receive_packet`
 8. `core/RtmpPublisher.cpp`：`avformat_alloc_output_context2("flv")` → `avformat_new_stream` → `avio_open2` → `avformat_write_header` → `av_interleaved_write_frame` → `av_write_trailer`
+
+## 7. `CameraCapture::open()` 详解
+
+`open()` 要回答三个问题：**设备在哪 → 里面是什么 → 怎么变成帧**。对应代码里的三段：
+
+### 7.1 找到并打开设备（设备在哪）
+
+| 步骤 | 函数 | 作用 |
+|---|---|---|
+| ① | `avdevice_register_all()` | 注册 dshow / v4l2 / lavfi 等设备类输入格式，不调用的话下一步找不到 |
+| ② | `av_find_input_format("dshow")` | 按名字找输入格式（demuxer），摄像头在 FFmpeg 眼里也是一种“输入格式” |
+| ③ | 拼 URL | dshow 的设备地址是 `video=设备名`，比如 `video=Integrated Camera` |
+| ④ | `av_dict_set(&opts, ...)` | 把 `video_size` / `framerate` / `pixel_format` / `vcodec` / `rtbufsize` 放进选项字典，等价于命令行 `-i` 前面的参数 |
+| ⑤ | `avformat_alloc_context()` | **先**分配一个空的 `AVFormatContext`，目的是在打开前装上中断回调（见 7.4） |
+| ⑥ | `avformat_open_input(&ctx, url, ifmt, &opts)` | 真正打开设备。失败时 FFmpeg 会自己释放 ctx；成功后字典里剩下的是“没被用到的选项”，程序会打印警告提示拼写错误 |
+
+### 7.2 探流（里面是什么）
+
+| 步骤 | 函数 | 作用 |
+|---|---|---|
+| ⑦ | `avformat_find_stream_info()` | 先读几包数据，探测流的详细参数：分辨率、帧率、编码格式（rawvideo 还是 mjpeg） |
+| ⑧ | `av_dump_format()` | 把探测结果打印出来，和 ffmpeg 命令行里的 `Input #0` 一样 |
+| ⑨ | `av_find_best_stream(VIDEO)` | 找出“最合适”的视频流下标，顺便返回它的解码器 `AVCodec*` |
+
+### 7.3 准备解码器（怎么变成帧）
+
+| 步骤 | 函数 | 作用 |
+|---|---|---|
+| ⑩ | `avcodec_alloc_context3(decoder)` | 分配解码器上下文 |
+| ⑪ | `avcodec_parameters_to_context()` | 把流参数（宽高、像素格式、extradata）拷给解码器 |
+| ⑫ | `codecCtx->pkt_timebase = stream->time_base` | 告诉解码器 pts 的单位，解出来的帧 pts 才对 |
+| ⑬ | `avcodec_open2()` | 初始化解码器。YUYV 等原始格式走 rawvideo（几乎直接拷贝），MJPEG 走 mjpeg 解码器 |
+| ⑭ | `makePacket()` + 记录 `info_` | 分配之后 `readFrame()` 反复使用的 `AVPacket`；记下宽高、像素格式、time_base，并用 `av_guess_frame_rate` 估计帧率 |
+
+任何一步失败都会 `setError(...)` 记下原因、`close()` 释放已经打开的资源，然后返回 `false`。
+
+### 7.4 中断回调（interrupt_callback）是干嘛的
+
+**问题**：`avformat_open_input`、`av_read_frame`、网络写包这些 FFmpeg 函数都是**阻塞调用**：设备卡住、网络断了的时候，函数不返回，程序就一直等在里面。这时候按 Ctrl+C，主循环根本没机会去检查“要不要退出”。
+
+**解决**：给 `AVFormatContext` 装一个回调函数。FFmpeg 在阻塞等待的过程中会**定期调用它问一句“还要继续等吗？”**：
+- 返回 `0`：继续等
+- 返回非 `0`：立刻放弃这次阻塞调用，函数返回错误码 `AVERROR_EXIT`
+
+本项目里的实现（`capture/CameraCapture.cpp`）：
+
+```cpp
+int CameraCapture::interruptCallback(void* opaque) {
+    auto* self = static_cast<CameraCapture*>(opaque);   // opaque 就是装回调时传进去的 this
+    return self->stopRequested_ ? 1 : 0;                // 用户要求停止就返回 1
+}
+
+// open() 里，avformat_open_input 之前：
+rawCtx->interrupt_callback.callback = &CameraCapture::interruptCallback;
+rawCtx->interrupt_callback.opaque = this;
+```
+
+整条 Ctrl+C 退出链路：
+
+```
+Ctrl+C → consoleCtrlHandler / signalHandler（app/main.cpp）
+       → requestStop() → capture->requestStop()       // 只是把 atomic<bool> stopRequested_ 设成 true
+       → FFmpeg 阻塞中定期调用 interruptCallback → 返回 1
+       → av_read_frame 返回 AVERROR_EXIT
+       → readFrame() 记下“用户请求停止”，送空包把解码器里剩下的帧冲出来，最后返回 Eof
+       → main 循环结束，析构时释放所有资源
+```
+
+几个细节：
+- **为什么要先 `avformat_alloc_context` 再 open**：如果直接 `avformat_open_input(&nullCtx, ...)`，上下文是 FFmpeg 在函数内部才创建的，我们没机会在“打开”这一步之前装回调，打开设备卡住时就没法中断。
+- **为什么回调是 `static` 函数 + `opaque`**：FFmpeg 是 C 库，只认普通函数指针，不能直接传成员函数，所以用 `opaque` 把 `this` 带进去，在回调里再转回 `CameraCapture*`。
+- **为什么 `stopRequested_` 是 `std::atomic<bool>`**：Ctrl+C 处理函数在另一个线程（Windows）或信号上下文里写它，FFmpeg 在采集线程里读它，用 atomic 避免数据竞争。
+- **`readFrame()` 自己也会检查 `stopRequested_`**：每次要读新包之前看一眼，就算 FFmpeg 没有走到回调，正常出帧时也能及时退出。回调负责的是“卡在 FFmpeg 里面出不来”的那种情况。
+- `RtmpPublisher` 用的是同一套做法（再加上 `rw_timeout` 5 秒超时），所以推流时服务器失联也能 Ctrl+C 退出。
