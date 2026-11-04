@@ -5,3 +5,5 @@ frames/
 *.user
 third_party/
 thirdParty/
+*.flv
+*.mp4
