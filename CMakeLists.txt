@@ -98,14 +98,20 @@ target_include_directories(streamer_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(streamer_core PUBLIC FFmpeg::FFmpeg)
 
 # ============================================================================
-# capture: 采集源（现在只有摄像头，以后加 ScreenCapture）
+# capture: 采集源（摄像头 CameraCapture + 桌面 ScreenCapture）
 # ============================================================================
 add_library(streamer_capture STATIC
     capture/ICapture.h
     capture/CameraCapture.h
     capture/CameraCapture.cpp
+    capture/ScreenCapture.h
+    capture/ScreenCapture.cpp
 )
 target_link_libraries(streamer_capture PUBLIC streamer_core)
+if(WIN32)
+    # ScreenCapture 调用了 SetProcessDPIAware（在 user32.dll 里）
+    target_link_libraries(streamer_capture PUBLIC user32)
+endif()
 
 # ============================================================================
 # app: 命令行工具

@@ -1,5 +1,8 @@
 // ============================================================================
-// push_main.cpp —— 摄像头采集 → H.264 编码 → RTMP 推流
+// push_main.cpp —— 摄像头 / 桌面采集 → H.264 编码 → RTMP 推流
+//
+// 采集源由 --screen 决定：不加 = 摄像头（CameraCapture），加了 = 桌面（ScreenCapture）。
+// 两者都实现 ICapture，所以后面的编码和推流代码一行都不用改。
 //
 // 线程模型：采集线程读摄像头 → FrameQueue（最多 3 帧，满了丢最旧的）→ 主线程编码并推流
 //
@@ -12,6 +15,7 @@
 // ============================================================================
 
 #include "capture/CameraCapture.h"
+#include "capture/ScreenCapture.h"
 #include "core/FrameQueue.h"
 #include "core/RtmpPublisher.h"
 #include "core/VideoEncoder.h"
@@ -21,6 +25,7 @@ extern "C" {
 #include <libavutil/pixdesc.h>
 }
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -67,6 +72,8 @@ void signalHandler(int) { requestStop(); }
 
 struct PushOptions {
     CameraOptions camera;
+    bool screen = false;          // true = 采集桌面而不是摄像头
+    ScreenOptions screenOpt;
     std::string url = "rtmp://localhost/live/test";
     std::string encoder;          // 空 = 自动选择
     int bitrateKbps = 2000;
@@ -79,7 +86,8 @@ struct PushOptions {
 void printUsage(const char* prog) {
     std::cout <<
         "用法:\n"
-        "  " << prog << " -d \"设备名\" -o rtmp://服务器/live/流名 [选项]\n"
+        "  " << prog << " -d \"设备名\" -o rtmp://服务器/live/流名 [选项]   （摄像头）\n"
+        "  " << prog << " --screen -o rtmp://服务器/live/流名 [选项]       （桌面）\n"
         "\n"
         "选项:\n"
         "  -d, --device NAME     摄像头名字（用 camera_capture --list 查看）\n"
@@ -90,6 +98,16 @@ void printUsage(const char* prog) {
         "      --vcodec CODEC    让摄像头输出 mjpeg 等压缩格式\n"
         "      --pix-fmt FMT     摄像头原始像素格式\n"
         "      --out-size WxH    推流分辨率（和采集不同时自动缩放）\n"
+        "\n"
+        "桌面采集选项:\n"
+        "      --screen          采集桌面（Windows 用 gdigrab），不需要 -d\n"
+        "      --window TITLE    只抓标题为 TITLE 的窗口\n"
+        "      --region WxH      只抓一块区域，例如 1280x720（默认全屏）\n"
+        "      --offset X,Y      区域左上角坐标，例如 100,200\n"
+        "      --no-mouse        画面里不画鼠标\n"
+        "      --all-monitors    抓所有显示器（默认只抓主显示器）\n"
+        "      （桌面默认等比缩放到不超过 1920x1080，可用 --out-size 覆盖）\n"
+        "\n"
         "  -b, --bitrate KBPS    码率，单位 kbps，默认 2000\n"
         "  -g, --gop SECONDS     关键帧间隔（秒），默认 1。越小延迟越低\n"
         "      --encoder NAME    指定编码器：libx264 / h264_nvenc / h264_qsv / h264_amf / h264_mf\n"
@@ -99,7 +117,8 @@ void printUsage(const char* prog) {
         "  -h, --help            显示帮助\n"
         "\n"
         "示例:\n"
-        "  " << prog << " -d \"Integrated Camera\" -s 1280x720 -o rtmp://localhost/live/test\n";
+        "  " << prog << " -d \"Integrated Camera\" -s 1280x720 -o rtmp://localhost/live/test\n"
+        "  " << prog << " --screen -r 30 --out-size 1920x1080 -o rtmp://localhost/live/screen\n";
 }
 
 bool parseSize(const std::string& s, int& w, int& h) {
@@ -130,7 +149,17 @@ bool parseArgs(int argc, char** argv, PushOptions& opt, int& exitCode) {
             else if (a == "-d" || a == "--device") opt.camera.deviceName = next();
             else if (a == "-o" || a == "--output") opt.url = next();
             else if (a == "-s" || a == "--size") opt.camera.videoSize = next();
-            else if (a == "-r" || a == "--fps") opt.camera.frameRate = next();
+            else if (a == "-r" || a == "--fps") opt.camera.frameRate = opt.screenOpt.frameRate = next();
+            else if (a == "--screen") opt.screen = true;
+            else if (a == "--window") { opt.screen = true; opt.screenOpt.target = "title=" + next(); }
+            else if (a == "--region") opt.screenOpt.videoSize = next();
+            else if (a == "--offset") {
+                std::string v = next();
+                if (std::sscanf(v.c_str(), "%d,%d", &opt.screenOpt.offsetX, &opt.screenOpt.offsetY) != 2)
+                    throw std::invalid_argument("--offset 格式应为 X,Y，例如 100,200");
+            }
+            else if (a == "--no-mouse") opt.screenOpt.drawMouse = false;
+            else if (a == "--all-monitors") opt.screenOpt.allMonitors = true;
             else if (a == "--vcodec") opt.camera.vcodec = next();
             else if (a == "--pix-fmt") opt.camera.pixelFormat = next();
             else if (a == "--out-size") opt.outSize = next();
@@ -138,7 +167,7 @@ bool parseArgs(int argc, char** argv, PushOptions& opt, int& exitCode) {
             else if (a == "--encoder") opt.encoder = next();
             else if (a == "-g" || a == "--gop") opt.gopSeconds = static_cast<int>(toInt(next()));
             else if (a == "-n" || a == "--frames") opt.maxFrames = toInt(next());
-            else if (a == "-f" || a == "--format") opt.camera.inputFormat = next();
+            else if (a == "-f" || a == "--format") opt.camera.inputFormat = opt.screenOpt.inputFormat = next();
             else if (a == "-v" || a == "--verbose") opt.verbose = true;
             else throw std::invalid_argument("未知参数: " + a);
         } catch (const std::invalid_argument& e) {
@@ -147,6 +176,11 @@ bool parseArgs(int argc, char** argv, PushOptions& opt, int& exitCode) {
             exitCode = 1;
             return false;
         }
+    }
+    if (opt.screen) {
+        // 桌面模式下 -d 可以用来直接指定 gdigrab 的 URL（例如 -d "title=计算器"），一般不需要
+        if (!opt.camera.deviceName.empty() && opt.screenOpt.target.empty()) opt.screenOpt.target = opt.camera.deviceName;
+        return true;
     }
     if (opt.camera.deviceName.empty()) {
         std::cerr << "请用 -d 指定摄像头名字（先运行 camera_capture --list 查看）\n\n";
@@ -176,10 +210,17 @@ int main(int argc, char** argv) {
     // avformat_network_init: 初始化网络模块（Windows 上会初始化 Winsock），推 RTMP 前调用一次
     avformat_network_init();
 
-    // ---------------- 1. 打开摄像头 ----------------
-    std::unique_ptr<ICapture> capture = std::make_unique<CameraCapture>(opt.camera);
+    // ---------------- 1. 打开采集源（摄像头或桌面） ----------------
+    // 多态：capture 的静态类型是 ICapture，后面所有代码只调用接口里的函数
+    std::unique_ptr<ICapture> capture;
+    if (opt.screen) {
+        capture = std::make_unique<ScreenCapture>(opt.screenOpt);
+        std::cout << "正在打开桌面采集 ...\n";
+    } else {
+        capture = std::make_unique<CameraCapture>(opt.camera);
+        std::cout << "正在打开摄像头: " << opt.camera.deviceName << " ...\n";
+    }
     g_capture = capture.get();
-    std::cout << "正在打开摄像头: " << opt.camera.deviceName << " ...\n";
     if (!capture->open()) {
         std::cerr << "错误: " << capture->lastError() << "\n";
         return 1;
@@ -241,6 +282,13 @@ int main(int argc, char** argv) {
         std::cerr << "--out-size 格式应为 宽x高，例如 1280x720\n";
         stopCapture();
         return 1;
+    }
+    // 桌面模式默认缩小：高分屏原始分辨率很大（例如 3000x2104），编码慢、延迟高，
+    // 浏览器也不一定解得动。没指定 --out-size 时，等比缩放到不超过 1920x1080。
+    if (opt.screen && opt.outSize.empty() && (encOpt.width > 1920 || encOpt.height > 1080)) {
+        double k = std::min(1920.0 / encOpt.width, 1080.0 / encOpt.height);
+        encOpt.width = static_cast<int>(encOpt.width * k);
+        encOpt.height = static_cast<int>(encOpt.height * k);
     }
     // H.264 的 yuv420p 要求宽高是偶数
     encOpt.width &= ~1;
